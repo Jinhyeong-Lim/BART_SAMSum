@@ -13,15 +13,16 @@ model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large")
 
 def preprocess_function(examples):
     inputs = [doc for doc in examples["dialogue"]]
-    model_inputs = tokenizer(inputs, max_length=512, truncation=True)
+    model_inputs = tokenizer(inputs, max_length=1024, truncation=True)
 
-    labels = tokenizer(text_target=examples["summary"], max_length=80, truncation=True)
+    labels = tokenizer(text_target=examples["summary"], max_length=128, truncation=True)
 
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
 
 tokenized_samsum = samsum.map(preprocess_function, batched=True)
+
 data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 rouge = evaluate.load("rouge")
 
@@ -45,10 +46,12 @@ training_args = Seq2SeqTrainingArguments(
     per_device_train_batch_size= 8,
     per_device_eval_batch_size= 8,
     save_total_limit=3,
-    evaluation_strategy="epoch",
+    evaluation_strategy="steps",
     gradient_accumulation_steps= 1,
-    learning_rate= 5e-5,
-    num_train_epochs= 3.0,
+    learning_rate= 2e-5,
+    max_steps=10000,
+    eval_steps=1000,
+    save_steps=1000,
     weight_decay= 0.1,
     label_smoothing_factor=0.1,
     predict_with_generate=True,
@@ -56,7 +59,42 @@ training_args = Seq2SeqTrainingArguments(
     seed=1
 )
 
-trainer = Seq2SeqTrainer(
+
+class BartTrainer(Seq2SeqTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # implement custom logic here
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            #if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+            #    loss = self.label_smoother(outputs, labels, shift_labels=True)
+            #else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss
+
+
+trainer = BartTrainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_samsum["train"],
